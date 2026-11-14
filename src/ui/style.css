@@ -496,6 +496,19 @@ body {
 .setup[hidden] { display: none; }
 .content[hidden] { display: none; }
 
+#vcRedistWarn {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 10px 14px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: #3a1d1d;
+  color: #ffd9d9;
+  border: 1px solid #6b2b2b;
+}
+#vcRedistWarn[hidden] { display: none; }
+
 .setup-card {
   width: 100%;
   max-width: 780px;

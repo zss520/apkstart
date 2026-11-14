@@ -892,7 +892,7 @@ function bindEvents() {
     btnVc.disabled = true;
     const r = await api.installVcRedist().catch(() => ({ ok: false }));
     if (r && r.ok) {
-      document.getElementById('vcRedistWarn').hidden = true;
+      setVcRedistWarn(false);
       toast({ title: 'VC++ 运行库已安装', body: '现在可以启动运行时了', type: 'ok' });
     } else if (r && r.reason === 'no-installer') {
       api.openExternal('https://learn.microsoft.com/zh-CN/cpp/windows/latest-supported-vc-redist?view=msvc-170#visual-studio-2015-2017-2019-and-2022');
@@ -1073,17 +1073,25 @@ async function init() {
   setInterval(refreshApps, 15000);
 }
 
+// 已安装或检测失败时保持隐藏。内联 display 会盖过 hidden，所以两边一起设。
+function setVcRedistWarn(visible) {
+  const warn = document.getElementById('vcRedistWarn');
+  if (!warn) return;
+  warn.hidden = !visible;
+  warn.style.display = visible ? 'flex' : 'none';
+}
+
 // VC++ 运行库检测：缺失时显示横幅，提供一键提权安装
 async function checkVcRedist() {
   const warn = document.getElementById('vcRedistWarn');
   if (!warn) return;
   try {
     const r = await api.vcRedist();
-    if (r && r.ok) { warn.hidden = true; return; }
-    warn.hidden = false;
+    if (r && r.ok) { setVcRedistWarn(false); return; }
+    setVcRedistWarn(true);
     warn._hasInstaller = !!r.path;
     document.getElementById('btnInstallVcRedist').disabled = !r.path;
-  } catch (_) { /* 检测失败不阻断主流程 */ }
+  } catch (_) { setVcRedistWarn(false); }
 }
 
 init().catch((e) => {

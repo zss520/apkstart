@@ -45,7 +45,7 @@ class EmulatorEngine {
   get snapshotDirty() { return !!this._snapshotDirty; }
 
   log(line) {
-    this._log.push({ t: Date.now(), line });
+    this._log.push({ t: Date.now(), line, attempt: this._attempt || 0 });
     if (this._log.length > 600) this._log.shift();
   }
 
@@ -547,6 +547,7 @@ class EmulatorEngine {
 
     for (let i = 0; i < variants.length; i += 1) {
       const base = variants[i];
+      this._attempt = i + 1;
       // 端口占用也会导致失败，每次重试重新探测一次
       // eslint-disable-next-line no-await-in-loop
       const port = i === 0 ? startPort : await doctor.freePortPair(startPort + (i * 2));
@@ -566,7 +567,7 @@ class EmulatorEngine {
       // eslint-disable-next-line no-await-in-loop
       await sleep(2500);
       if (!this.proc) {
-        const d = doctor.diagnose(this.recentLog(60));
+        const d = doctor.diagnose(this.recentLog(60, { attempt: true }));
         this.attempts.push({ plan: plan.label, diagnosis: d.code });
         this.lastDiagnosis = d;
         lastError = `${d.title}：${d.hint}`;
@@ -595,10 +596,11 @@ class EmulatorEngine {
         if (state === 'fatal') { fatal = true; break; }
         // 只要 adb 能执行 shell，说明内核已经在引导，日志里的普通 Vulkan/EGL 信息不算失败
         if (state === 'booting') sawBooting = true;
-        // 45 秒仍完全没连上，且日志出现明确致命错误 → 提前换方案，不干等 4 分钟
-        if (!sawBooting && Date.now() - started > 45000) {
-          const d = doctor.diagnose(this.recentLog(80));
-          if (['GPU_INIT', 'ACCEL', 'GPU_MODE', 'IMAGE', 'DLL', 'MEMORY'].includes(d.code)) {
+        // 45 秒仍完全没连上，且这一档自己的日志出现明确致命错误 → 提前换方案。
+        // 软件模拟（-accel off）冷启动要数分钟，WHPX 未安装是预期日志，不能在这里杀掉。
+        if (plan.accel !== 'off' && !sawBooting && Date.now() - started > 45000) {
+          const d = doctor.diagnose(this.recentLog(80, { attempt: true }));
+          if (doctor.earlyAbortCodes(plan).includes(d.code)) {
             this.lastDiagnosis = d;
             fatal = true;
             break;
@@ -623,7 +625,7 @@ class EmulatorEngine {
         };
       }
 
-      const d = fatal ? (this.lastDiagnosis || doctor.diagnose(this.recentLog(80))) : doctor.diagnose(this.recentLog(80));
+      const d = fatal ? (this.lastDiagnosis || doctor.diagnose(this.recentLog(80, { attempt: true }))) : doctor.diagnose(this.recentLog(80, { attempt: true }));
       this.attempts.push({ plan: plan.label, diagnosis: d.code, timeout: !fatal });
       this.lastDiagnosis = d;
       lastError = fatal ? `${d.title}：${d.hint}` : '开机超时（可能是首次引导较慢或硬件加速未生效）';
@@ -684,7 +686,11 @@ class EmulatorEngine {
     return true;
   }
 
-  recentLog(n = 40) { return this._log.slice(-n).map((x) => x.line); }
+  recentLog(n = 40, { attempt = false } = {}) {
+    let rows = this._log;
+    if (attempt) rows = rows.filter((x) => x.attempt === this._attempt);
+    return rows.slice(-n).map((x) => x.line);
+  }
 }
 
 /**

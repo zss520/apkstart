@@ -48,10 +48,17 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(p.cores === 2, `核心应为 2，实际 ${p.cores}`);
     assert(p.accel === 'off', '无硬件加速应自动回退软件模拟');
     assert(p.bootTimeoutMs > 240000, '软件模拟应给更长的开机超时');
-    assert(p.gpu === 'host', `首选渲染应为 host（失败由 planVariants 降级），实际 ${p.gpu}`);
-    // accel 关闭时的保底参数必须是软件渲染，否则 TCG 下无 GPU 可用
-    const lastResort = doctor.planVariants(p).find((v) => v.lastResort);
+    assert(/software|swiftshader/.test(p.gpu), `无加速时首选应为软件渲染，实际 ${p.gpu}`);
+    // 没有 WHPX/AEHD 时不要先崩一次主机显卡，也不要再试一遍会被拒绝的自动加速。
+    const variants = doctor.planVariants(p);
+    assert(variants.length === 2, `无加速只应冷启动一次加一次保底，实际 ${variants.length}`);
+    assert(variants[0].accel === 'off' && /software|swiftshader/.test(variants[0].gpu), JSON.stringify(variants[0]));
+    assert(!variants.some((v) => v.gpu === 'host' || v.accel === 'auto'), '无加速不应再试 host 或自动加速');
+    assert(variants[0].bootTimeoutMs >= 600000, '软件模拟要等完冷启动');
+    assert(!doctor.earlyAbortCodes(variants[0]).includes('ACCEL'), '软件模拟不能因 WHPX 未安装被提前杀掉');
+    const lastResort = variants.find((v) => v.lastResort);
     assert(lastResort && /software|swiftshader/.test(lastResort.gpu), '保底方案必须用软件渲染');
+    assert(lastResort.accel === 'off' && lastResort.wipe === true);
     assert(p.dataMB <= 4096, '数据分区不应再是 16G');
   });
 
@@ -71,6 +78,7 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(v.length >= 3 && v.length <= 4, `重试次数应 3-4，实际 ${v.length}`);
     assert(v.some((x) => x.accel === 'off'), '缺少软件模拟兜底');
     assert(v[v.length - 1].wipe === true, '最后一档应强制冷启动清快照');
+    assert(v[0].gpu === 'host' && v[0].accel === 'auto', '有加速时第一档仍是主机显卡');
     assert(v[v.length - 1].memoryMB <= 2048, '最后一档应降到最小内存');
     const keys = v.map((x) => `${x.gpu}|${x.accel}|${x.wipe}|${x.memoryMB}`);
     assert(new Set(keys).size === keys.length, '重试方案不应重复');
@@ -90,6 +98,37 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(doctor.diagnose(['panic: AVD apkstart is already running']).code === 'AVD_LOCK');
     assert(doctor.diagnose(['non-ASCII path is not supported']).code === 'NON_ASCII');
     assert(doctor.diagnose(['random line']).code === 'UNKNOWN');
+    assert(doctor.diagnose(['emulator exit 3221225477']).code === 'CRASH');
+  });
+
+  await test('accel-check：AEHD/HAXM 没装不能否决已经可用的 WHPX', () => {
+    const whpx = doctor.parseAccelCheck([
+      'accel:',
+      '0',
+      'WHPX(10.0.26100) is installed and usable.',
+      'Android Emulator hypervisor driver is not installed on this machine',
+      'accel',
+    ].join('\n'));
+    assert(whpx.ok === true && whpx.kind === 'whpx', JSON.stringify(whpx));
+
+    const aehd = doctor.parseAccelCheck([
+      'accel:',
+      '0',
+      'AEHD (version 2.2) is installed and usable.',
+      'WHPX is either not available or not installed.',
+      'Unable to open AEHD device: ERROR_ACCESS_DENIED',
+      'accel',
+    ].join('\n'));
+    assert(aehd.ok === true && aehd.kind === 'aehd', JSON.stringify(aehd));
+
+    const none = doctor.parseAccelCheck([
+      'accel:',
+      '6',
+      'WHPX is either not available or not installed.',
+      'Android Emulator hypervisor driver is not installed on this machine',
+      'accel',
+    ].join('\n'));
+    assert(none.ok === false && none.kind === 'none', JSON.stringify(none));
   });
 
   await test('空闲端口探测返回偶数端口对', async () => {
@@ -793,6 +832,27 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(/-no-snapshot/.test(args), '旧快照删掉后、新快照写完前必须冷启动');
     assert(!/-snapshot apkstart/.test(args));
     assert(saves >= 1, '没有应用窗口时应排队补存');
+  });
+
+  console.log('\n[provision.js 跨平台打包]');
+  await test('非 Windows 打包机用 PE 头确认 Windows 二进制，Windows 上不走这条捷径', () => {
+    const { windowsBinaryStub } = require('../src/core/provision');
+    const dir = path.join(TMP, 'pe');
+    fs.mkdirSync(dir, { recursive: true });
+    const pe = path.join(dir, 'adb.exe');
+    const buf = Buffer.alloc(70 * 1024);
+    buf.write('MZ', 0, 'ascii');
+    fs.writeFileSync(pe, buf);
+    const bad = path.join(dir, 'not.exe');
+    fs.writeFileSync(bad, Buffer.alloc(70 * 1024, 1));
+    if (process.platform === 'win32') {
+      assert(windowsBinaryStub(pe) === null, 'Windows 上必须以实际运行结果为准');
+      return;
+    }
+    const ok = windowsBinaryStub(pe);
+    assert(ok && ok.ok && ok.path === pe, 'PE 文件应视为已就位');
+    assert(windowsBinaryStub(bad) === null, '非 PE 不能放行');
+    assert(windowsBinaryStub(path.join(dir, 'missing.exe')) === null, '缺失文件不能放行');
   });
 
   console.log(results.join('\n'));
