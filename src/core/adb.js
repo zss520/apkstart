@@ -108,6 +108,31 @@ class AdbError extends Error {
 }
 
 /**
+ * 解析 `adb devices` / `adb devices -l` 的正文。
+ * 保留 offline 等非 device 状态，调用方自己筛选。
+ */
+function parseAdbDevices(text) {
+  const rows = [];
+  for (const raw of String(text || '').split('\n')) {
+    const l = raw.trim();
+    if (!l || l.startsWith('List of devices') || l.startsWith('*')) continue;
+    const parts = l.split(/\s+/);
+    if (parts.length < 2) continue;
+    rows.push({
+      serial: parts[0],
+      state: parts[1],
+      model: (l.match(/model:(\S+)/) || [])[1] || '',
+    });
+  }
+  return rows;
+}
+
+/** 只有残留的 offline 记录才需要重启 adb server。在线设备不应被 kill-server 打断。 */
+function shouldResetAdbServer(rows) {
+  return (rows || []).some((d) => d && d.state === 'offline');
+}
+
+/**
  * 解析 `find -exec stat -c '%Y|%s|%n'` 的输出。
  * 返回 null 表示输出不像 stat 结果（设备不支持）。
  */
@@ -312,14 +337,7 @@ class AdbClient {
 
   async devices() {
     const { stdout } = await this.exec(['devices', '-l'], { withSerial: false });
-    return stdout.split('\n').slice(1)
-      .map((l) => l.trim())
-      .filter((l) => l && l.includes('device') && !l.startsWith('*'))
-      .map((l) => {
-        const parts = l.split(/\s+/);
-        return { serial: parts[0], state: parts[1], model: (l.match(/model:(\S+)/) || [])[1] || '' };
-      })
-      .filter((d) => d.state === 'device');
+    return parseAdbDevices(stdout).filter((d) => d.state === 'device');
   }
 
   /**
@@ -614,7 +632,10 @@ class AdbClient {
   }
 
   async shellMkdir(remote) {
-    await this.shell(`mkdir -p "${remote}"`);
+    const s = String(remote || '');
+    if (!s || /[\0\r\n]/.test(s)) throw new Error('非法路径');
+    const q = `'${s.replace(/'/g, `'\\''`)}'`;
+    await this.shell(`mkdir -p ${q}`);
   }
 
   async listRemote(remote) {
@@ -646,7 +667,8 @@ class AdbClient {
   async listRemoteStat(remote) {
     let out = '';
     try {
-      out = await this.shell(`cd "${remote}" 2>/dev/null && find . -type f -exec stat -c '%Y|%s|%n' {} + 2>/dev/null`);
+      const q = `'${String(remote).replace(/'/g, `'\\''`)}'`;
+      out = await this.shell(`cd ${q} 2>/dev/null && find . -type f -exec stat -c '%Y|%s|%n' {} + 2>/dev/null`);
     } catch (_) {
       return null;
     }
@@ -812,4 +834,7 @@ class AdbClient {
   }
 }
 
-module.exports = { AdbClient, AdbError, parseStatList, friendlyInstallError, friendlyLaunchError };
+module.exports = {
+  AdbClient, AdbError, parseStatList, parseAdbDevices, shouldResetAdbServer,
+  friendlyInstallError, friendlyLaunchError,
+};

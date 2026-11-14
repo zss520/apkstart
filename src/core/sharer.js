@@ -11,6 +11,42 @@ const store = require('./store');
 
 const MAX_FILE = 512 * 1024 * 1024; // 单文件 512MB 上限
 
+/**
+ * 只接受共享目录内部的相对路径。
+ * 拒绝空段、`.`、`..`、绝对路径、盘符、NUL 和换行，避免客机文件名逃出目录或打断 shell。
+ */
+function safeRel(rel) {
+  const s = String(rel || '').replace(/\\/g, '/');
+  if (!s || /[\0\r\n]/.test(s)) return null;
+  if (s.startsWith('/') || /^[A-Za-z]:/.test(s)) return null;
+  const parts = s.split('/');
+  if (parts.some((p) => p === '' || p === '.' || p === '..')) return null;
+  return parts.join('/');
+}
+
+/** POSIX 单引号。路径里的单引号写成 `'\''`，整段仍是一个参数。 */
+function shSingleQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+/** 本机绝对路径必须仍在 root 里面。safeRel 已经挡住 `..`，这里再挡一次解析后的结果。 */
+function localPathInside(root, rel) {
+  const safe = safeRel(rel);
+  if (!safe || !root) return null;
+  const base = path.resolve(root);
+  const abs = path.resolve(base, ...safe.split('/'));
+  if (abs !== base && !abs.startsWith(base + path.sep)) return null;
+  return abs;
+}
+
+/** `mkdir -p` 父目录。rel 不安全时返回 null，调用方跳过该文件。 */
+function quotedMkdirParent(remoteDir, rel) {
+  const safe = safeRel(rel);
+  if (!safe) return null;
+  const remote = `${String(remoteDir || '').replace(/\/+$/, '')}/${safe}`;
+  return `mkdir -p ${shSingleQuote(path.posix.dirname(remote))}`;
+}
+
 function walk(dir, base = dir, out = []) {
   let items = [];
   try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return out; }
@@ -54,7 +90,9 @@ class Sharer {
     if (!fs.existsSync(this.localDir)) fs.mkdirSync(this.localDir, { recursive: true });
     const client = this.runtime.client();
     if (!(await client.isOnline())) return false;
-    await client.shellMkdir(this.remoteDir);
+    const root = String(this.remoteDir || '');
+    if (!root || /[\0\r\n]/.test(root)) throw new Error('共享目录路径不安全');
+    await client.shell(`mkdir -p ${shSingleQuote(root)}`);
     return true;
   }
 
@@ -74,9 +112,15 @@ class Sharer {
         const prev = state[f.rel];
         const changed = !prev || Math.abs((prev.mtime || 0) - f.mtime) > 1500 || prev.size !== f.size;
         if (!changed) continue;
-        const remote = `${this.remoteDir}/${f.rel}`;
+        const mkdirCmd = quotedMkdirParent(this.remoteDir, f.rel);
+        const rel = safeRel(f.rel);
+        if (!mkdirCmd || !rel) {
+          result.errors.push(`↑ ${f.rel}: 路径不安全，已跳过`);
+          continue;
+        }
+        const remote = `${String(this.remoteDir).replace(/\/+$/, '')}/${rel}`;
         try {
-          await client.shell(`mkdir -p "$(dirname '${remote}')"`);
+          await client.shell(mkdirCmd);
           await client.push(f.abs, remote);
           state[f.rel] = { mtime: f.mtime, size: f.size, dir: 'up' };
           result.pushed++;
@@ -104,12 +148,18 @@ class Sharer {
         // 让整次同步中断，表现为「设备 → 本机永远不同步」
         const mtimeSame = (prev && r.mtime) ? Math.abs((prev.mtime || 0) - r.mtime) <= 1500 : false;
         if (prev && sizeSame && mtimeSame) continue;
-        const local = path.join(this.localDir, r.rel);
+        const rel = safeRel(r.rel);
+        const local = rel ? localPathInside(this.localDir, rel) : null;
+        if (!rel || !local) {
+          result.errors.push(`↓ ${r.rel}: 路径不安全，已跳过`);
+          continue;
+        }
+        const remote = `${String(this.remoteDir).replace(/\/+$/, '')}/${rel}`;
         try {
           fs.mkdirSync(path.dirname(local), { recursive: true });
-          await client.pull(`${this.remoteDir}/${r.rel}`, local);
+          await client.pull(remote, local);
           const st = fs.statSync(local);
-          state[r.rel] = { mtime: st.mtimeMs, size: st.size, dir: 'down' };
+          state[rel] = { mtime: st.mtimeMs, size: st.size, dir: 'down' };
           result.pulled++;
         } catch (e) {
           result.errors.push(`↓ ${r.rel}: ${e.message}`);
@@ -133,12 +183,17 @@ class Sharer {
     if (depth === 0 && !prefix) {
       try {
         const text = await client.shell(
-          `cd "${base}" 2>/dev/null && find . -type f -exec stat -c '%s|%Y|%n' {} + 2>/dev/null`,
+          `cd ${shSingleQuote(base)} 2>/dev/null && find . -type f -exec stat -c '%s|%Y|%n' {} + 2>/dev/null`,
         );
         const rows = String(text).split('\n').map((l) => l.trim()).filter(Boolean)
           .map((l) => /^(\d+)\|(\d+)\|(.+)$/.exec(l))
           .filter(Boolean)
-          .map((m) => ({ rel: m[3].replace(/^\.\//, ''), size: Number(m[1]), mtime: Number(m[2]) * 1000 }));
+          .map((m) => {
+            const rel = safeRel(m[3].replace(/^\.\//, ''));
+            if (!rel) return null;
+            return { rel, size: Number(m[1]), mtime: Number(m[2]) * 1000 };
+          })
+          .filter(Boolean);
         if (rows.length) return rows;
       } catch (_) { /* 落到 ls 解析 */ }
     }
@@ -170,4 +225,4 @@ class Sharer {
   get lastError() { return this._lastError; }
 }
 
-module.exports = { Sharer };
+module.exports = { Sharer, safeRel, shSingleQuote, localPathInside, quotedMkdirParent };

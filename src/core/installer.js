@@ -179,8 +179,6 @@ class Installer {
   async finishInstall(rt, meta, filePath, bundle, onProgress) {
     const client = rt.client;
     const existing = store.getApp(meta.package);
-    // 装完之后旧 quickboot 快照里的磁盘状态就过期了，留着会导致「装好的应用重启后又不见了」
-    try { this.runtime.emulator?.invalidateSnapshot(); } catch (_) { /* ignore */ }
     onProgress({ stage: 'install', message: existing ? '正在更新应用…' : '正在安装应用…' });
     try {
       if (bundle) await client.installMultiple(bundle.files);
@@ -274,6 +272,10 @@ class Installer {
       warnings.push(`此应用要求 Android ${meta.minSdk}+，高于当前运行时，可能无法正常运行。`);
     }
     client.batteryOptimizeOff(meta.package).catch(() => {});
+
+    // 安装已经成功才作废旧快照。失败时保留原快照，避免一次安装错误就变成冷启动。
+    // 有应用窗口时不立刻保存（数 GB 的 ram.bin 会抢磁盘），等最后一个窗口关闭。
+    try { await this.runtime.noteInstallCommitted(); } catch (_) { /* 快照失败不影响已装好的应用 */ }
 
     onProgress({ stage: 'done', message: `${app.label} 安装完成`, app });
     return { app, warnings, engine: rt.engine };

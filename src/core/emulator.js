@@ -16,6 +16,7 @@ const path = require('path');
 const store = require('./store');
 const { Provisioner } = require('./provision');
 const doctor = require('./doctor');
+const { appendCapped } = require('./log');
 
 const AVD_NAME = 'apkstart';
 const SNAPSHOT_NAME = 'apkstart';
@@ -36,7 +37,12 @@ class EmulatorEngine {
     // 快照的 ram.bin ≈ 分配给虚拟机的内存（2-4GB）。
     // 冷启动本来就快的机器不该为它付出几个 GB 的磁盘，只在「真慢」时才保存。
     this.snapshotWorthSaving = null;
+    // 安装成功后置位：旧快照已删，需要在空闲时重存，期间不能加载旧内存。
+    this._snapshotDirty = false;
+    this._snapChain = null;
   }
+
+  get snapshotDirty() { return !!this._snapshotDirty; }
 
   log(line) {
     this._log.push({ t: Date.now(), line });
@@ -66,19 +72,69 @@ class EmulatorEngine {
     return { compat: false, api: base.api, tag: base.tag, dir: base.dir, abi: base.abi || this.provisioner.paths().sysAbi };
   }
 
+  _snapshotDir() {
+    return path.join(this.provisioner.paths().avdHome, `${AVD_NAME}.avd`, 'snapshots');
+  }
+
+  _invalidateSnapshotFiles() {
+    const snapDir = this._snapshotDir();
+    try {
+      fs.rmSync(snapDir, { recursive: true, force: true });
+    } catch (_) {
+      try { fs.renameSync(snapDir, `${snapDir}.stale-${Date.now()}`); } catch (__) { /* ignore */ }
+    }
+  }
+
   /**
-   * 作废 quickboot 快照。
-   * 快照同时保存内存和磁盘镜像，装完新应用/清了数据后如果还加载旧快照，
+   * 快照相关操作串行执行，避免「保存写到一半又被删掉」或「删完又被旧的保存写回去」。
+   */
+  _enqueueSnapshot(task) {
+    const prev = this._snapChain || Promise.resolve();
+    const job = prev.then(() => task(), () => task());
+    this._snapChain = job.then(() => {}, () => {});
+    return job;
+  }
+
+  /**
+   * 作废 quickboot 快照，并标记为待重存。
+   * 快照同时保存内存和磁盘镜像。装完新应用后如果还加载旧快照，
    * 用户会看到「刚刚装好的应用重启后又不见了」。
+   * 安装失败不应调用这里。
    */
   invalidateSnapshot() {
-    try {
-      const snapDir = path.join(this.provisioner.paths().avdHome, `${AVD_NAME}.avd`, 'snapshots');
-      fs.rmSync(snapDir, { recursive: true, force: true });
+    return this._enqueueSnapshot(() => {
+      this._invalidateSnapshotFiles();
+      this._snapshotDirty = true;
       return true;
-    } catch (_) {
-      return false;
-    }
+    });
+  }
+
+  /**
+   * 把当前运行中的客户机存成 quickboot。
+   * onlyIfDirty：安装之后的补存。失败时清掉可能写了一半的目录，下次冷启动走 -no-snapshot。
+   * 不传 onlyIfDirty 时总会尝试保存（开机后的第一份，以及本进程持有句柄时的关机）。
+   */
+  saveSnapshot(adbPath, { timeout = 60000, serial, onlyIfDirty = false } = {}) {
+    return this._enqueueSnapshot(() => this._saveSnapshotNow(adbPath, { timeout, serial, onlyIfDirty }));
+  }
+
+  _saveSnapshotNow(adbPath, { timeout = 60000, serial, onlyIfDirty = false } = {}) {
+    if (onlyIfDirty && !this._snapshotDirty) return Promise.resolve(false);
+    if (!adbPath) return Promise.resolve(false);
+    const target = serial || this.serial;
+    return new Promise((resolve) => {
+      execFile(adbPath, ['-s', target, 'emu', 'avd', 'snapshot', 'save', SNAPSHOT_NAME], {
+        timeout, windowsHide: true,
+      }, (err) => {
+        if (!err) {
+          this._snapshotDirty = false;
+          resolve(true);
+          return;
+        }
+        if (this._snapshotDirty) this._invalidateSnapshotFiles();
+        resolve(false);
+      });
+    });
   }
 
   /**
@@ -130,19 +186,22 @@ class EmulatorEngine {
     } catch (_) { /* ignore */ }
     // 2) 兜底：命令行里引用本 AVD 的 qemu / emulator
     try {
+      const script = [
+        "Get-CimInstance Win32_Process -Filter \"Name = 'qemu-system-x86_64.exe' OR Name = 'emulator.exe'\" |",
+        "ForEach-Object {",
+        "  Write-Output ('PID=' + $_.ProcessId)",
+        "  Write-Output ('CMD=' + $_.CommandLine)",
+        "  Write-Output '---'",
+        "}",
+      ].join(' ');
       const out = await new Promise((res) => execFile(
-        'wmic',
-        ['process', 'where', "name='qemu-system-x86_64.exe' or name='emulator.exe'", 'get', 'processid,commandline', '/format:csv'],
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
         { windowsHide: true, maxBuffer: 32 * 1024 * 1024 },
         (e, o) => res(e ? '' : o || ''),
       ));
-      for (const line of String(out).split('\n')) {
-        if (line.includes(AVD_NAME) && /qemu|emulator/i.test(line)) {
-          const m = /,(\d+)\s*$/.exec(line.trim());
-          if (m) pids.add(Number(m[1]));
-        }
-      }
-    } catch (_) { /* wmic 不可用就只靠锁文件 */ }
+      for (const pid of parseCimProcessDump(out, AVD_NAME)) pids.add(pid);
+    } catch (_) { /* CIM 不可用就只靠锁文件 */ }
     pids.delete(process.pid);
     if (!pids.size) {
       this.clearLocks(avdDir);
@@ -336,7 +395,7 @@ class EmulatorEngine {
       memoryMB: plan.memoryMB, cores: plan.cores,
       snapshot: plan.snapshot, wipe: plan.wipe, lcd: plan.lcd,
     });
-    fs.appendFileSync(logFile, `\n--- ${new Date().toISOString()} ${plan.label} ---\n${loc.emulatorExe} ${args.join(' ')}\n`);
+    appendCapped(logFile, `\n--- ${new Date().toISOString()} ${plan.label} ---\n${loc.emulatorExe} ${args.join(' ')}\n`);
 
     const proc = spawn(loc.emulatorExe, args, {
       cwd: path.dirname(loc.emulatorExe),
@@ -362,7 +421,7 @@ class EmulatorEngine {
         for (const l of lines) {
           if (!l.trim()) continue;
           this.log(l.trim());
-          fs.appendFileSync(logFile, `${l.trim()}\n`);
+          appendCapped(logFile, `${l.trim()}\n`);
         }
       });
     };
@@ -370,13 +429,13 @@ class EmulatorEngine {
     pipe(proc.stderr);
     proc.on('exit', (code) => {
       this.log(`emulator exit ${code}`);
-      fs.appendFileSync(logFile, `emulator exit ${code}\n`);
+      appendCapped(logFile, `emulator exit ${code}\n`);
       this.proc = null;
       onLog(`运行时已退出（code=${code}）`);
     });
     proc.on('error', (e) => {
       this.log(`spawn error: ${e.message}`);
-      fs.appendFileSync(logFile, `spawn error: ${e.message}\n`);
+      appendCapped(logFile, `spawn error: ${e.message}\n`);
       this.proc = null;
     });
 
@@ -473,7 +532,7 @@ class EmulatorEngine {
 
     const logFile = path.join(store.DATA_DIR, 'logs', 'emulator.log');
     fs.mkdirSync(path.dirname(logFile), { recursive: true });
-    fs.appendFileSync(logFile, `\n\n=== ${new Date().toISOString()} START ${doctor.describeProfile(profile)} ===\n`);
+    appendCapped(logFile, `\n\n=== ${new Date().toISOString()} START ${doctor.describeProfile(profile)} ===\n`);
 
     // 屏幕规格在整个启动过程中保持一致，否则每次重试都换分辨率会狂清快照
     const screen = doctor.lcdFor({ accelOk: accelInfo.ok });
@@ -593,17 +652,14 @@ class EmulatorEngine {
 
   /**
    * 开机成功后顺手存一份 quickboot 快照。
-   * 模拟器进程活不过 ApkStart（Electron 退出会连带清理子进程），所以不能指望
-   * "退出时再存"；开机完趁系统干净存一份，下次打开直接 7 秒进桌面而不是 25 秒。
-   * 装新应用后 installer 会作废快照，不用担心应用消失。
+   * qemu 是 detached 的，关掉壳层之后它还可以被下次接管；这份快照留给真正冷启动用。
+   * 装新应用后会把快照标脏并在空闲时重存，避免「重启后应用消失」。
    */
   saveSnapshotSoon(adbPath) {
     if (this._snapQueued || !adbPath) return;
     this._snapQueued = true;
-    const serial = this.serial;
     setTimeout(() => {
-      execFile(adbPath, ['-s', serial, 'emu', 'avd', 'snapshot', 'save', SNAPSHOT_NAME],
-        { timeout: 60000, windowsHide: true }, () => { /* 存不上就算了，下次照常冷启动 */ });
+      this.saveSnapshot(adbPath).catch(() => {});
     }, 6000).unref?.();
   }
 
@@ -612,10 +668,7 @@ class EmulatorEngine {
     if (!this.proc) return true;
     const serial = this.serial;
     if (adbPath && this.snapshotWorthSaving !== false) {
-      await new Promise((resolve) => {
-        execFile(adbPath, ['-s', serial, 'emu', 'avd', 'snapshot', 'save', SNAPSHOT_NAME],
-          { timeout: 8000, windowsHide: true }, () => resolve());
-      });
+      await this.saveSnapshot(adbPath, { timeout: 8000, serial });
     }
     if (adbPath) {
       await new Promise((resolve) => {
@@ -634,4 +687,35 @@ class EmulatorEngine {
   recentLog(n = 40) { return this._log.slice(-n).map((x) => x.line); }
 }
 
-module.exports = { EmulatorEngine, AVD_NAME, SNAPSHOT_NAME };
+/**
+ * 解析 Get-CimInstance 打出来的 PID=/CMD=/--- 文本。
+ * 只收下命令行里带本 AVD 名、且像 qemu/emulator 的进程。
+ */
+function parseCimProcessDump(text, avdName) {
+  const name = String(avdName || '');
+  const pids = [];
+  let pid = 0;
+  let cmd = '';
+  const flush = () => {
+    if (pid && name && cmd.includes(name) && /qemu|emulator/i.test(cmd)) pids.push(pid);
+    pid = 0;
+    cmd = '';
+  };
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line === '---') { flush(); continue; }
+    const pm = /^PID=(\d+)$/.exec(line);
+    if (pm) {
+      if (pid || cmd) flush();
+      pid = Number(pm[1]);
+      continue;
+    }
+    const cm = /^CMD=(.*)$/.exec(line);
+    if (cm) cmd = cm[1];
+  }
+  flush();
+  return pids;
+}
+
+module.exports = { EmulatorEngine, AVD_NAME, SNAPSHOT_NAME, parseCimProcessDump };

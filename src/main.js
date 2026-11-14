@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 
 const store = require('./core/store');
+const { appendCapped } = require('./core/log');
 const { Runtime } = require('./core/engine');
 const { Installer } = require('./core/installer');
 const { Sharer } = require('./core/sharer');
@@ -56,11 +57,7 @@ const IS_DEV = process.argv.includes('--dev');
  * 只记关键节点和异常，正常路径几千行也不会撑爆。
  */
 function appLog(line) {
-  try {
-    const dir = path.join(store.DATA_DIR, 'logs');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, 'app.log'), `${new Date().toISOString()} ${line}\n`);
-  } catch (_) { /* 日志失败不能影响主流程 */ }
+  appendCapped(path.join(store.DATA_DIR, 'logs', 'app.log'), `${new Date().toISOString()} ${line}\n`);
 }
 process.on('uncaughtException', (e) => appLog(`UNCAUGHT ${e && (e.stack || e.message)}`));
 process.on('unhandledRejection', (e) => appLog(`REJECT ${e && (e.stack || e.message || e)}`));
