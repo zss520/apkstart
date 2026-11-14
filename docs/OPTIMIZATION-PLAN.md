@@ -2,6 +2,8 @@
 
 本文对照 v0.2.7 源码，判断上一轮架构评审里的优化项能不能在现有结构里做完，以及第一刀该改哪些函数。结论按「可落地 / 分步做 / 暂缓」三档，不按日历排期。
 
+可落地的五项已经写进代码：共享路径约束（`sharer.js`）、日志 2MB 轮转（`log.js`）、进程枚举改为 CIM（`emulator.js`）、接管时只有 offline 记录才 `kill-server`（`engine.js`）、安装成功后才作废快照并在空闲或接管关机前补存。分步项和暂缓项没有改。
+
 统计与阅读范围：`src/main.js`、`src/ui/app.js`、`src/core/*`、`src/core/win/*`、`test/auto-test.js`、`.github/workflows/ci.yml`。CI 在 `windows-latest` 上跑 `npm test` 和鼠标钩子冒烟，不启动 Android。
 
 ## 总判

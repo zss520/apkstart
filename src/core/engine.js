@@ -11,7 +11,7 @@ const { spawn, execFile } = require('child_process');
 const net = require('net');
 const fs = require('fs');
 const path = require('path');
-const { AdbClient } = require('./adb');
+const { AdbClient, parseAdbDevices, shouldResetAdbServer } = require('./adb');
 const store = require('./store');
 const { Provisioner } = require('./provision');
 const { EmulatorEngine } = require('./emulator');
@@ -458,6 +458,13 @@ class Runtime {
     let online = false;
     try { online = await this.client().isOnline(); } catch (_) { /* ignore */ }
     if (online && this.emuSerial) {
+      // 接管来的进程没有本地句柄。安装后快照若还是脏的，先补存再关机，
+      // 否则看门狗一关，下次只能冷启动。保存失败会清掉半截目录。
+      await this.emulator.saveSnapshot(this.adbPath(), {
+        serial: this.client().serial,
+        onlyIfDirty: true,
+        timeout: 8000,
+      }).catch(() => {});
       await this.client().exec(['emu', 'kill'], { timeout: 8000 }).catch(() => {});
       for (let i = 0; i < 10; i += 1) {
         // eslint-disable-next-line no-await-in-loop
@@ -622,9 +629,16 @@ class Runtime {
     }
     onLog(`发现 ${alive.length} 台残留运行时（端口 ${alive.join(', ')}），尝试接管`);
 
-    // adb server 里可能还留着上个进程的 offline 记录（模拟器重启过 adbd 就会这样），
-    // 先清掉再连，否则 get-state 永远返回 offline，会误判成"没就绪"把好好的机器杀掉。
-    await this.client().exec(['kill-server'], { withSerial: false, timeout: 8000 }).catch(() => {});
+    // 只在 adb 里留着 offline 幽灵记录时才重启 server。
+    // 无条件 kill-server 会把还活着的模拟器连接和其他使用 5044 的客户端一起打断。
+    let deviceRows = [];
+    try {
+      const { stdout } = await this.client().exec(['devices'], { withSerial: false, timeout: 8000 });
+      deviceRows = parseAdbDevices(stdout);
+    } catch (_) { /* 列不出来就直接尝试连接 */ }
+    if (shouldResetAdbServer(deviceRows)) {
+      await this.client().exec(['kill-server'], { withSerial: false, timeout: 8000 }).catch(() => {});
+    }
 
     for (const port of alive) {
       const serial = `127.0.0.1:${port + 1}`;
@@ -836,6 +850,12 @@ class Runtime {
       const cmds = container.buildIdleCommands({ deep: !!(s.engine && s.engine.deepTrim) });
       await this.client().shell(cmds.join(' ; '), { timeout: 15000 }).catch(() => '');
       await this.emulator.setPriority('idle').catch(() => {});
+      // 有应用窗口时不存快照（ram.bin 有数 GB，会抢前台磁盘）。
+      // onlyIfDirty 在队列里判断：安装作废快照可能还排在前面，不能在这里提前读标志。
+      this.emulator.saveSnapshot(this.adbPath(), {
+        serial: this.client().serial,
+        onlyIfDirty: true,
+      }).catch(() => {});
       try { onIdle(true); } catch (_) { /* ignore */ }
       this.log('容器已停放（Android 常驻，0 个应用进程，qemu 最低优先级）');
     }
@@ -853,6 +873,22 @@ class Runtime {
   }
 
   setGuestPriority(level) { return this.emulator.setPriority(level); }
+
+  /**
+   * 安装已经落盘之后调用。安装失败不要走这里，否则会把还能用的快照删掉。
+   * 当前没有应用窗口时马上在后台补存；有窗口则等 endApp 进入空闲。
+   */
+  async noteInstallCommitted() {
+    if (!this.emulator) return false;
+    await this.emulator.invalidateSnapshot();
+    if (this.containerIdle) {
+      this.emulator.saveSnapshot(this.adbPath(), {
+        serial: this.client().serial,
+        onlyIfDirty: true,
+      }).catch(() => {});
+    }
+    return true;
+  }
 
   // ---------------- 空闲回收 ----------------
 

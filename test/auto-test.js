@@ -682,6 +682,119 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(r.hooked === false && b.ready === null, '默认关闭时不能启动 PowerShell');
   });
 
+  console.log('\n[可落地优化]');
+
+  await test('共享路径：拒绝穿越，单引号按 POSIX 转义', () => {
+    const { safeRel, shSingleQuote, quotedMkdirParent, localPathInside } = require('../src/core/sharer');
+    assert(safeRel('a/b.txt') === 'a/b.txt');
+    assert(safeRel('a b/c.txt') === 'a b/c.txt');
+    assert(safeRel('../x') === null && safeRel('a/../../b') === null && safeRel('..\\x') === null);
+    assert(safeRel('/etc/passwd') === null && safeRel('C:/Windows') === null);
+    assert(safeRel('a\nb') === null && safeRel('') === null);
+    assert(shSingleQuote("o'hare") === `'o'\\''hare'`);
+    const cmd = quotedMkdirParent('/sdcard/ApkStartShared', "o'hare/file.txt");
+    assert(cmd === "mkdir -p '/sdcard/ApkStartShared/o'\\''hare'", cmd);
+    assert(quotedMkdirParent('/sdcard/ApkStartShared', '../x') === null);
+    const root = path.join(TMP, 'shared-root');
+    fs.mkdirSync(root, { recursive: true });
+    assert(localPathInside(root, 'a/b.txt') === path.resolve(root, 'a', 'b.txt'));
+    assert(localPathInside(root, '../outside') === null);
+  });
+
+  await test('adb devices：offline 才重启 server，在线设备保留', () => {
+    const { parseAdbDevices, shouldResetAdbServer } = require('../src/core/adb');
+    const text = [
+      'List of devices attached',
+      'emulator-5554          device product:sdk model:sdk_gphone64_x86_64 device:emu64xa',
+      '127.0.0.1:5555         offline',
+      'emulator-5556          unauthorized',
+    ].join('\n');
+    const rows = parseAdbDevices(text);
+    assert(rows.length === 3, JSON.stringify(rows));
+    assert(rows[0].state === 'device' && rows[0].model === 'sdk_gphone64_x86_64', JSON.stringify(rows[0]));
+    assert(shouldResetAdbServer(rows) === true);
+    assert(shouldResetAdbServer(rows.filter((d) => d.state === 'device')) === false);
+    assert(shouldResetAdbServer([]) === false);
+  });
+
+  await test('CIM 进程列表只收下带本 AVD 名的 qemu', () => {
+    const { parseCimProcessDump } = require('../src/core/emulator');
+    const text = [
+      'PID=10',
+      'CMD=C:\\emu\\qemu-system-x86_64.exe -avd other',
+      '---',
+      'PID=42',
+      'CMD=C:\\emu\\qemu-system-x86_64.exe -avd apkstart -port 5554',
+      '---',
+      'PID=7',
+      'CMD=C:\\Windows\\notepad.exe apkstart',
+      '---',
+    ].join('\n');
+    const pids = parseCimProcessDump(text, 'apkstart');
+    assert(pids.length === 1 && pids[0] === 42, JSON.stringify(pids));
+  });
+
+  await test('日志超过 2MB 时轮转一份 .1', () => {
+    const { appendCapped } = require('../src/core/log');
+    const file = path.join(TMP, 'logs', 'app.log');
+    appendCapped(file, 'a'.repeat(64), 32);
+    appendCapped(file, 'b'.repeat(40), 32);
+    assert(fs.existsSync(`${file}.1`), '应留下一份旧日志');
+    const cur = fs.readFileSync(file, 'utf8');
+    assert(cur === 'b'.repeat(40), `新文件应只含最新写入，实际长度 ${cur.length}`);
+    assert(fs.readFileSync(`${file}.1`, 'utf8').startsWith('a'), '旧日志应被换到 .1');
+  });
+
+  await test('安装失败不删快照，成功后才标脏并让下次冷启动走 -no-snapshot', async () => {
+    const store = require('../src/core/store');
+    const { Runtime } = require('../src/core/engine');
+    const { Installer } = require('../src/core/installer');
+    store.saveSettings({ createShortcutOnInstall: false });
+    const rt = new Runtime(path.join(__dirname, '..'));
+    let saves = 0;
+    rt.emulator.saveSnapshot = async () => { saves += 1; return true; };
+    const inst = new Installer(rt, {
+      launcherTarget: 'ApkStart.exe',
+      launcherArgs: '',
+      cwd: TMP,
+      desktopDir: TMP,
+    });
+    const meta = {
+      package: 'com.example.demo',
+      label: 'Demo',
+      versionName: '1.0',
+      versionCode: 1,
+      abis: ['x86_64'],
+      iconPng: null,
+      launchActivity: '.Main',
+      sizeBytes: 100,
+      minSdk: 21,
+    };
+    const client = {
+      install: async () => { throw Object.assign(new Error('安装失败'), { code: 'INSTALL_FAILED_INTERNAL_ERROR' }); },
+      resolveLauncher: async () => 'com.example.demo/.Main',
+      batteryOptimizeOff: () => Promise.resolve(),
+    };
+    let threw = false;
+    try {
+      await inst.finishInstall({ client, engine: 'emulator' }, meta, path.join(TMP, 'missing.apk'), null, () => {});
+    } catch (_) { threw = true; }
+    assert(threw, '安装失败应抛出');
+    assert(rt.emulator.snapshotDirty === false, '失败时不能把快照标脏');
+
+    const snapDir = path.join(rt.emulator.provisioner.paths().avdHome, 'apkstart.avd', 'snapshots', 'apkstart');
+    fs.mkdirSync(snapDir, { recursive: true });
+    fs.writeFileSync(path.join(snapDir, 'ram.bin'), 'old');
+    client.install = async () => 'Success';
+    await inst.finishInstall({ client, engine: 'emulator' }, meta, path.join(TMP, 'missing.apk'), null, () => {});
+    assert(rt.emulator.snapshotDirty === true, '成功安装后快照应为脏，等待空闲补存');
+    assert(!fs.existsSync(snapDir), '成功安装后应作废旧快照目录');
+    const args = rt.emulator.buildArgs({ gpu: 'software', memoryMB: 2048, cores: 2, snapshot: true }).join(' ');
+    assert(/-no-snapshot/.test(args), '旧快照删掉后、新快照写完前必须冷启动');
+    assert(!/-snapshot apkstart/.test(args));
+    assert(saves >= 1, '没有应用窗口时应排队补存');
+  });
+
   console.log(results.join('\n'));
   console.log(`\n结果：${passed} 通过，${failed} 失败\n`);
   try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (_) { /* ignore */ }
