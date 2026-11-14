@@ -36,6 +36,12 @@ extraResources:
       - "**/*"
       - "!.prepared"
 
+# Linux 上打 NSIS 时要跑一次安装包来抽出卸载程序。
+# 1.0.1 使用 electron-builder 自带的 Wine 11，不依赖系统里的 wine。
+# Windows 构建直接执行安装包，不会下载这份 Wine。
+toolsets:
+  wine: "1.0.1"
+
 win:
   target:
     - target: nsis
