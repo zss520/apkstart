@@ -101,6 +101,26 @@ function fileSize(p) {
   try { return fs.statSync(p).size; } catch (_) { return 0; }
 }
 
+/**
+ * 非 Windows 打包机无法执行 adb.exe / emulator.exe。
+ * 文件存在且是 PE（MZ）时视为已就位，避免跨平台打安装包被误判成解压失败。
+ * Windows 上不走这条路径，仍以实际运行结果为准。
+ */
+function windowsBinaryStub(file) {
+  if (IS_WIN) return null;
+  try {
+    if (fileSize(file) < 64 * 1024) return null;
+    const fd = fs.openSync(file, 'r');
+    const b = Buffer.alloc(2);
+    const n = fs.readSync(fd, b, 0, 2, 0);
+    fs.closeSync(fd);
+    if (n < 2 || b.toString('ascii') !== 'MZ') return null;
+    return { ok: true, path: file, version: 'windows-binary' };
+  } catch (_) {
+    return null;
+  }
+}
+
 class Provisioner {
   constructor(appRoot) {
     this.appRoot = appRoot;
@@ -190,6 +210,11 @@ class Provisioner {
         const v = { ok: true, path: c, version: m ? m[1] : r.stdout.split('\n')[0].trim() };
         this._adbCache = { at: Date.now(), value: v };
         return v;
+      }
+      const stub = windowsBinaryStub(c);
+      if (stub) {
+        this._adbCache = { at: Date.now(), value: stub };
+        return stub;
       }
     }
     this._adbCache = { at: Date.now(), value: { ok: false, path: '', version: '' } };
@@ -452,6 +477,12 @@ class Provisioner {
         this._cache.emulatorVersion = { ok: true, path: c, version: m[1] };
         this._cache.emulatorVerAt = Date.now();
         return this._cache.emulatorVersion;
+      }
+      const stub = windowsBinaryStub(c);
+      if (stub) {
+        this._cache.emulatorVersion = stub;
+        this._cache.emulatorVerAt = Date.now();
+        return stub;
       }
     }
     return { ok: false, path: '', version: '' };
@@ -949,4 +980,4 @@ class Provisioner {
   }
 }
 
-module.exports = { Provisioner, SOURCES, MIN_SIZE, absUrl, baseOf };
+module.exports = { Provisioner, SOURCES, MIN_SIZE, absUrl, baseOf, windowsBinaryStub };

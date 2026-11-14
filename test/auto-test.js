@@ -795,6 +795,27 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(saves >= 1, '没有应用窗口时应排队补存');
   });
 
+  console.log('\n[provision.js 跨平台打包]');
+  await test('非 Windows 打包机用 PE 头确认 Windows 二进制，Windows 上不走这条捷径', () => {
+    const { windowsBinaryStub } = require('../src/core/provision');
+    const dir = path.join(TMP, 'pe');
+    fs.mkdirSync(dir, { recursive: true });
+    const pe = path.join(dir, 'adb.exe');
+    const buf = Buffer.alloc(70 * 1024);
+    buf.write('MZ', 0, 'ascii');
+    fs.writeFileSync(pe, buf);
+    const bad = path.join(dir, 'not.exe');
+    fs.writeFileSync(bad, Buffer.alloc(70 * 1024, 1));
+    if (process.platform === 'win32') {
+      assert(windowsBinaryStub(pe) === null, 'Windows 上必须以实际运行结果为准');
+      return;
+    }
+    const ok = windowsBinaryStub(pe);
+    assert(ok && ok.ok && ok.path === pe, 'PE 文件应视为已就位');
+    assert(windowsBinaryStub(bad) === null, '非 PE 不能放行');
+    assert(windowsBinaryStub(path.join(dir, 'missing.exe')) === null, '缺失文件不能放行');
+  });
+
   console.log(results.join('\n'));
   console.log(`\n结果：${passed} 通过，${failed} 失败\n`);
   try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (_) { /* ignore */ }
