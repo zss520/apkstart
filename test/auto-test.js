@@ -49,9 +49,13 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(p.accel === 'off', '无硬件加速应自动回退软件模拟');
     assert(p.bootTimeoutMs > 240000, '软件模拟应给更长的开机超时');
     assert(p.gpu === 'host', `首选渲染应为 host（失败由 planVariants 降级），实际 ${p.gpu}`);
-    // accel 关闭时的保底参数必须是软件渲染，否则 TCG 下无 GPU 可用
-    const lastResort = doctor.planVariants(p).find((v) => v.lastResort);
+    // 检测失败时仍先试自动加速。host + -accel off 在 emulator 37 上会 0xC0000005。
+    const variants = doctor.planVariants(p);
+    assert(variants[0].gpu === 'host' && variants[0].accel === 'auto', JSON.stringify(variants[0]));
+    assert(!variants.some((v) => v.gpu === 'host' && v.accel === 'off'), '不能把 host GPU 和关闭加速配在一起');
+    const lastResort = variants.find((v) => v.lastResort);
     assert(lastResort && /software|swiftshader/.test(lastResort.gpu), '保底方案必须用软件渲染');
+    assert(lastResort.accel === 'off');
     assert(p.dataMB <= 4096, '数据分区不应再是 16G');
   });
 
@@ -90,6 +94,37 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(doctor.diagnose(['panic: AVD apkstart is already running']).code === 'AVD_LOCK');
     assert(doctor.diagnose(['non-ASCII path is not supported']).code === 'NON_ASCII');
     assert(doctor.diagnose(['random line']).code === 'UNKNOWN');
+    assert(doctor.diagnose(['emulator exit 3221225477']).code === 'CRASH');
+  });
+
+  await test('accel-check：AEHD/HAXM 没装不能否决已经可用的 WHPX', () => {
+    const whpx = doctor.parseAccelCheck([
+      'accel:',
+      '0',
+      'WHPX(10.0.26100) is installed and usable.',
+      'Android Emulator hypervisor driver is not installed on this machine',
+      'accel',
+    ].join('\n'));
+    assert(whpx.ok === true && whpx.kind === 'whpx', JSON.stringify(whpx));
+
+    const aehd = doctor.parseAccelCheck([
+      'accel:',
+      '0',
+      'AEHD (version 2.2) is installed and usable.',
+      'WHPX is either not available or not installed.',
+      'Unable to open AEHD device: ERROR_ACCESS_DENIED',
+      'accel',
+    ].join('\n'));
+    assert(aehd.ok === true && aehd.kind === 'aehd', JSON.stringify(aehd));
+
+    const none = doctor.parseAccelCheck([
+      'accel:',
+      '6',
+      'WHPX is either not available or not installed.',
+      'Android Emulator hypervisor driver is not installed on this machine',
+      'accel',
+    ].join('\n'));
+    assert(none.ok === false && none.kind === 'none', JSON.stringify(none));
   });
 
   await test('空闲端口探测返回偶数端口对', async () => {

@@ -5,6 +5,7 @@
  * 目标：不同机器上都不需要用户调任何参数。
  *  - chooseProfile()  根据物理内存、CPU、磁盘、加速状态、emulator 版本推导启动参数；
  *  - planVariants()   给出「启动失败后依次降级」的重试方案（GPU → 加速 → 内存 → 冷启动）；
+ *    禁止「-gpu host + -accel off」：emulator 37 上这个组合会以 0xC0000005 崩溃。
  *  - diagnose()       把 emulator 的英文 stderr 翻译成可执行的修复建议；
  *  - shortPath()      处理中文/空格安装路径（emulator 的 QEMU 对非 ASCII 路径极其敏感）。
  *
@@ -185,34 +186,74 @@ function autoProfile({ settings = {}, accel, emulatorVersion = '', diskMB = 0, p
   });
 }
 
+/** 软件渲染后端。关硬件加速时只能用它，不能配 -gpu host。 */
+function softwareGpu(gpus) {
+  const list = gpus && gpus.length ? gpus : ['software'];
+  return list.find((g) => g === 'software')
+    || list.find((g) => /software|swiftshader|swangle/.test(g))
+    || 'software';
+}
+
+/**
+ * 解析 `emulator -accel-check` 的输出。
+ * 成功样本里经常同时有「WHPX is installed and usable」和
+ * 「AEHD / HAXM is not installed」。后者只说明另一个加速器没装，不能把整体判失败。
+ */
+function parseAccelCheck(text) {
+  const raw = String(text || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const m = /(?:^|\n)\s*accel:\s*(\d+)/i.exec(raw);
+  const code = m ? Number(m[1]) : null;
+  const whpxUsable = /WHPX\s*(\([^)\n]*\)\s*)?is installed and usable/i.test(raw);
+  const aehdUsable = /AEHD\s*(\([^)\n]*\)\s*)?is installed and usable/i.test(raw);
+  const noteOff = '未启用硬件加速：将回退软件模拟（能跑但很慢）。建议安装 AEHD 驱动或开启「虚拟机平台」';
+  if (code === 0 || whpxUsable || aehdUsable) {
+    let kind = 'whpx';
+    if (aehdUsable && !whpxUsable) kind = 'aehd';
+    else if (!whpxUsable && /aehd/i.test(raw) && !/whpx|windows hypervisor platform/i.test(raw)) kind = 'aehd';
+    return {
+      ok: true,
+      kind,
+      code,
+      note: kind === 'aehd' ? 'AEHD 硬件加速已启用' : 'WHPX 硬件加速已启用',
+    };
+  }
+  return { ok: false, kind: 'none', code, note: noteOff };
+}
+
 /**
  * 失败重试矩阵：从「最优」到「最保守」，最多 4 次。
- * 依次换 GPU 后端 → 关硬件加速走 TCG → 降内存并强制冷启动清快照。
+ * 先让模拟器自己决定要不要硬件加速，再换软件渲染，最后才显式 -accel off。
+ * host GPU 配 -accel off 在 emulator 37 上会访问冲突退出（0xC0000005），不进入矩阵。
  */
 function planVariants(profile) {
   const out = [];
   const gpus = profile.gpuCandidates || [];
-  const firstGpu = profile.gpu || gpus[0] || 'software';
-  const safeGpu = gpus.find((g) => /software|swiftshader/.test(g)) || firstGpu;
-  const ordered = [firstGpu, ...gpus.filter((g) => g !== firstGpu && /swiftshader|swangle/.test(g))].slice(0, 2);
-  for (const gpu of ordered) {
-    out.push({ ...profile, gpu, label: `${gpu} / ${profile.accel === 'auto' ? '硬件加速' : '软件模拟'}`, wipe: false, snapshot: true });
+  const soft = softwareGpu(gpus);
+  const preferred = profile.gpu && (!gpus.length || gpus.includes(profile.gpu)) ? profile.gpu : (gpus[0] || 'host');
+  // 加速交给模拟器。用户手动指定的 GPU 仍然优先，但关闭加速的档只用软件渲染。
+  out.push({
+    ...profile, gpu: preferred, accel: 'auto', label: `${preferred} / 自动加速`, wipe: false, snapshot: true,
+  });
+  if (preferred !== soft) {
+    out.push({
+      ...profile, gpu: soft, accel: 'auto', label: `${soft} / 自动加速`, wipe: false, snapshot: true,
+    });
   }
   out.push({
     ...profile,
-    gpu: safeGpu,
+    gpu: soft,
     accel: 'off',
-    label: '关闭加速的软件模拟（慢，但兼容性最好）',
+    label: `${soft} / 软件模拟`,
     wipe: false,
     snapshot: false,
   });
   out.push({
     ...profile,
-    gpu: safeGpu,
+    gpu: soft,
     accel: 'off',
     memoryMB: 2048,
     cores: 2,
-    dataMB: Math.min(profile.dataMB, 2048),
+    dataMB: Math.min(profile.dataMB || 2048, 2048),
     label: '保守冷启动（最小内存 + 清快照）',
     wipe: true,
     snapshot: false,
@@ -269,6 +310,13 @@ function snapshotKey(plan, imageDir) {
 }
 
 const RULES = [
+  {
+    code: 'CRASH',
+    // 3221225477 = 0xC0000005。host GPU 配 -accel off 时 emulator 37 会这样退出。
+    re: /emulator exit (3221225477|-1073741819)\b|0xC0000005|STATUS_ACCESS_VIOLATION/,
+    title: '模拟器进程崩溃',
+    hint: '主机显卡不能和「关闭硬件加速」一起用。下一档会让模拟器自己启用加速；加速不可用时再改用软件渲染。',
+  },
   {
     code: 'GPU_INIT',
     // 只匹配「失败」语境：正常日志里也会出现 Vulkan/EGL/ANGLE 字样，不能误判为致命错误
@@ -425,7 +473,7 @@ function vcRedistOk() {
 
 module.exports = {
   hostInfo, freeDiskMB, isAsciiPath, shortPath, lcdFor, liteProfile,
-  versionNumbers, gpuCandidates, chooseProfile, planVariants,
+  versionNumbers, gpuCandidates, chooseProfile, planVariants, parseAccelCheck, softwareGpu,
   overridesFromSettings, autoProfile,
   freePortPair, freeAdbPort, snapshotKey,
   diagnose, describeProfile, writeReport, vcRedistOk,

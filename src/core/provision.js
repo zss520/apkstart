@@ -10,6 +10,7 @@ const path = require('path');
 const zlib = require('zlib');
 const { spawn, execFile } = require('child_process');
 const store = require('./store');
+const doctor = require('./doctor');
 const { download, downloadAny, downloadAnyParallel, head } = require('./download');
 const { ZipArchive, ZipFile } = require('./zip');
 
@@ -630,24 +631,22 @@ class Provisioner {
 
     const r = await run(exe, ['-accel-check'], { timeout: 30000 });
     const text = `${r.stdout}${r.stderr}`;
-    const usable = /accel:\s*\n?0\b/.test(text) && !/ERROR_ACCESS_DENIED|not installed/i.test(text);
+    // 成功输出里常夹着「另一个加速器 is not installed」。只认退出码 0 和
+    // 「is installed and usable」，不能因为 AEHD/HAXM 没装就把 WHPX 判掉。
+    const parsed = doctor.parseAccelCheck(text);
 
     let result;
-    if (usable) {
-      const kind = hasAehdFile && /aehd/i.test(text) ? 'aehd' : 'whpx';
-      result = { ok: true, kind, note: kind === 'whpx' ? 'WHPX 硬件加速已启用' : 'AEHD 硬件加速已启用' };
-    } else if (hasAehdFile && /aehd/i.test(text) && !/ERROR_ACCESS_DENIED/i.test(text)) {
-      result = { ok: true, kind: 'aehd', note: 'AEHD 硬件加速已启用' };
-    } else if (hv.dll && /whpx/i.test(text) && !/error|denied/i.test(text)) {
-      result = { ok: true, kind: 'whpx', note: 'WHPX 硬件加速已启用' };
+    if (parsed.ok) {
+      result = { ok: true, kind: parsed.kind, note: parsed.note, code: parsed.code };
     } else {
       result = {
         ok: false,
         kind: 'none',
+        code: parsed.code,
         whpx: hv.whpx,
         aehdInstalled: hasAehdFile,
         viaTcg: true,
-        note: '未启用硬件加速：将回退软件模拟（能跑但很慢）。建议安装 AEHD 驱动或开启「虚拟机平台」',
+        note: parsed.note,
       };
     }
     this._cache.accel = result;
