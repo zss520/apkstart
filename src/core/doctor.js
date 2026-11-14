@@ -137,7 +137,10 @@ function chooseProfile({
   const dataMB = disk && disk < 8192 ? 2048 : 4096;
 
   const gpus = gpuCandidates(emulatorVersion);
-  const gpu = overrides.gpuMode && gpus.includes(overrides.gpuMode) ? overrides.gpuMode : gpus[0];
+  // 没有硬件加速时不要首选 host：emulator 37 上主显卡会 0xC0000005，自动加速会被直接拒绝。
+  const gpu = overrides.gpuMode && gpus.includes(overrides.gpuMode)
+    ? overrides.gpuMode
+    : (accelOk ? gpus[0] : softwareGpu(gpus));
 
   return {
     memoryMB,
@@ -221,36 +224,62 @@ function parseAccelCheck(text) {
 }
 
 /**
- * 失败重试矩阵：从「最优」到「最保守」，最多 4 次。
- * 先让模拟器自己决定要不要硬件加速，再换软件渲染，最后才显式 -accel off。
- * host GPU 配 -accel off 在 emulator 37 上会访问冲突退出（0xC0000005），不进入矩阵。
+ * 45 秒提前换方案时认哪些诊断。
+ * 已经显式 -accel off 时，日志里的 “WHPX is not installed” 是预期现象，
+ * 软件模拟冷启动要好几分钟，不能拿它当失败。
+ */
+function earlyAbortCodes(plan) {
+  if (plan && plan.accel === 'off') return ['GPU_MODE', 'IMAGE', 'DLL', 'MEMORY'];
+  return ['GPU_INIT', 'ACCEL', 'GPU_MODE', 'IMAGE', 'DLL', 'MEMORY'];
+}
+
+/**
+ * 失败重试矩阵。
+ * 加速可用：主机显卡 → 软件渲染 → 关闭加速 → 清快照。
+ * 加速不可用：只做一次软件模拟。这一档失败（进程退出或整段超时）才清快照再来一次。
+ * 不在没有 WHPX/AEHD 时先试 host：那一档会 0xC0000005，接着自动加速又会被模拟器拒绝。
  */
 function planVariants(profile) {
   const out = [];
   const gpus = profile.gpuCandidates || [];
   const soft = softwareGpu(gpus);
-  const preferred = profile.gpu && (!gpus.length || gpus.includes(profile.gpu)) ? profile.gpu : (gpus[0] || 'host');
-  // 加速交给模拟器。用户手动指定的 GPU 仍然优先，但关闭加速的档只用软件渲染。
-  out.push({
-    ...profile, gpu: preferred, accel: 'auto', label: `${preferred} / 自动加速`, wipe: false, snapshot: true,
-  });
-  if (preferred !== soft) {
+  const slow = Math.max(profile.bootTimeoutMs || 0, 600000);
+  if (profile.accel === 'off') {
+    const gpu = /software|swiftshader|swangle/.test(profile.gpu || '') ? profile.gpu : soft;
     out.push({
-      ...profile, gpu: soft, accel: 'auto', label: `${soft} / 自动加速`, wipe: false, snapshot: true,
+      ...profile,
+      gpu,
+      accel: 'off',
+      bootTimeoutMs: slow,
+      label: `${gpu} / 软件模拟`,
+      wipe: false,
+      snapshot: profile.snapshot !== false,
+    });
+  } else {
+    const preferred = profile.gpu && (!gpus.length || gpus.includes(profile.gpu)) ? profile.gpu : (gpus[0] || 'host');
+    out.push({
+      ...profile, gpu: preferred, accel: 'auto', label: `${preferred} / 自动加速`, wipe: false, snapshot: true,
+    });
+    if (preferred !== soft) {
+      out.push({
+        ...profile, gpu: soft, accel: 'auto', label: `${soft} / 自动加速`, wipe: false, snapshot: true,
+      });
+    }
+    out.push({
+      ...profile,
+      gpu: soft,
+      accel: 'off',
+      bootTimeoutMs: slow,
+      label: `${soft} / 软件模拟`,
+      wipe: false,
+      snapshot: false,
     });
   }
   out.push({
     ...profile,
     gpu: soft,
     accel: 'off',
-    label: `${soft} / 软件模拟`,
-    wipe: false,
-    snapshot: false,
-  });
-  out.push({
-    ...profile,
-    gpu: soft,
-    accel: 'off',
+    bootTimeoutMs: slow,
     memoryMB: 2048,
     cores: 2,
     dataMB: Math.min(profile.dataMB || 2048, 2048),
@@ -473,7 +502,7 @@ function vcRedistOk() {
 
 module.exports = {
   hostInfo, freeDiskMB, isAsciiPath, shortPath, lcdFor, liteProfile,
-  versionNumbers, gpuCandidates, chooseProfile, planVariants, parseAccelCheck, softwareGpu,
+  versionNumbers, gpuCandidates, chooseProfile, planVariants, parseAccelCheck, softwareGpu, earlyAbortCodes,
   overridesFromSettings, autoProfile,
   freePortPair, freeAdbPort, snapshotKey,
   diagnose, describeProfile, writeReport, vcRedistOk,

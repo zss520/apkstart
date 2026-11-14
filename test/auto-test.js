@@ -48,14 +48,17 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(p.cores === 2, `核心应为 2，实际 ${p.cores}`);
     assert(p.accel === 'off', '无硬件加速应自动回退软件模拟');
     assert(p.bootTimeoutMs > 240000, '软件模拟应给更长的开机超时');
-    assert(p.gpu === 'host', `首选渲染应为 host（失败由 planVariants 降级），实际 ${p.gpu}`);
-    // 检测失败时仍先试自动加速。host + -accel off 在 emulator 37 上会 0xC0000005。
+    assert(/software|swiftshader/.test(p.gpu), `无加速时首选应为软件渲染，实际 ${p.gpu}`);
+    // 没有 WHPX/AEHD 时不要先崩一次主机显卡，也不要再试一遍会被拒绝的自动加速。
     const variants = doctor.planVariants(p);
-    assert(variants[0].gpu === 'host' && variants[0].accel === 'auto', JSON.stringify(variants[0]));
-    assert(!variants.some((v) => v.gpu === 'host' && v.accel === 'off'), '不能把 host GPU 和关闭加速配在一起');
+    assert(variants.length === 2, `无加速只应冷启动一次加一次保底，实际 ${variants.length}`);
+    assert(variants[0].accel === 'off' && /software|swiftshader/.test(variants[0].gpu), JSON.stringify(variants[0]));
+    assert(!variants.some((v) => v.gpu === 'host' || v.accel === 'auto'), '无加速不应再试 host 或自动加速');
+    assert(variants[0].bootTimeoutMs >= 600000, '软件模拟要等完冷启动');
+    assert(!doctor.earlyAbortCodes(variants[0]).includes('ACCEL'), '软件模拟不能因 WHPX 未安装被提前杀掉');
     const lastResort = variants.find((v) => v.lastResort);
     assert(lastResort && /software|swiftshader/.test(lastResort.gpu), '保底方案必须用软件渲染');
-    assert(lastResort.accel === 'off');
+    assert(lastResort.accel === 'off' && lastResort.wipe === true);
     assert(p.dataMB <= 4096, '数据分区不应再是 16G');
   });
 
@@ -75,6 +78,7 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(v.length >= 3 && v.length <= 4, `重试次数应 3-4，实际 ${v.length}`);
     assert(v.some((x) => x.accel === 'off'), '缺少软件模拟兜底');
     assert(v[v.length - 1].wipe === true, '最后一档应强制冷启动清快照');
+    assert(v[0].gpu === 'host' && v[0].accel === 'auto', '有加速时第一档仍是主机显卡');
     assert(v[v.length - 1].memoryMB <= 2048, '最后一档应降到最小内存');
     const keys = v.map((x) => `${x.gpu}|${x.accel}|${x.wipe}|${x.memoryMB}`);
     assert(new Set(keys).size === keys.length, '重试方案不应重复');
